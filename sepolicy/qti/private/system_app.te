@@ -1,0 +1,4 @@
+# Allow systemapps to check incremental progress 
+get_prop(system_app, incremental_prop)
+
+allow system_app proc_filesystems:file r_file_perms;

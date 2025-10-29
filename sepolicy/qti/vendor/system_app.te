@@ -1,3 +1,11 @@
+# Aware
+get_prop(system_app, vendor_aware_available_prop);
+
+allow system_app proc_pagetypeinfo:file r_file_perms;
+
+# android.ui and system.ui
+allow system_app rootfs:dir r_dir_perms;
+
 # Battery Health
 r_dir_file(system_app, vendor_sysfs_usb_supply)
 
