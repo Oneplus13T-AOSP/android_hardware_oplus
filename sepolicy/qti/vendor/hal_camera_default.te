@@ -51,3 +51,4 @@ rw_dir_file(hal_camera_default, vendor_proc_camera)
 rw_dir_file(hal_camera_default, vendor_sysfs_tof)
 
 set_prop(hal_camera_default, vendor_camera_prop)
+get_prop(hal_camera_default, vendor_system_prop)
