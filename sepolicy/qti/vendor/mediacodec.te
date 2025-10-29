@@ -2,3 +2,7 @@ set_prop(mediacodec, vendor_video_prop)
 
 allow mediacodec hal_dms_hwservice:hwservice_manager find;
 binder_call(mediacodec, hal_dms_default)
+
+allow mediacodec graphics_config_prop:file { read };
+dontaudit mediacodec system_prop:file { read };
+dontaudit mediacodec vendor_hal_qspmhal_hwservice:hwservice_manager { find };
