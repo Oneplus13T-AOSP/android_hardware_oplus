@@ -109,3 +109,6 @@ type vendor_proc_oplus_version, fs_type, proc_type;
 
 # Vibrator
 type vendor_sysfs_vibrator, fs_type, sysfs_type;
+
+# Walt
+type proc_walt, fs_type, proc_type;
