@@ -4,3 +4,9 @@ get_prop(platform_app, audio_config_prop)
 
 r_dir_file(platform_app, vendor_sysfs_graphics)
 r_dir_file(platform_app, vendor_sysfs_sde_crtc)
+
+# Qualcomm Soter
+allow platform_app vendor_hal_soteraidl_service:service_manager find;
+
+# Trustonic Soter fallback lookup
+allow platform_app hal_soter_service:service_manager find;
