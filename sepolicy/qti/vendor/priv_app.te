@@ -1,1 +1,4 @@
 allow priv_app apex_system_server_data_file:dir { search };
+
+# QSPM
+allow priv_app vendor_hal_qspmhal_service:service_manager find;
