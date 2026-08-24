@@ -6,8 +6,15 @@
 
 cc_defaults {
     name: "libshims_aidl_fingerprint.oplus_defaults",
-    srcs: ["SensorPropsShim.cpp"],
-    shared_libs: ["libbase"],
+    srcs: [
+        "SensorPropsShim.cpp",
+        "OplusFodShim.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libbinder_ndk",
+        "liblog",
+    ],
     device_specific: true,
 }
 
