@@ -19,6 +19,8 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <atomic>
+#include <errno.h>
 
 using aidl::android::hardware::biometrics::fingerprint::ISession;
 using aidl::android::hardware::biometrics::fingerprint::ISessionCallback;
@@ -38,7 +40,7 @@ static const char kSessionDesc[] = "android.hardware.biometrics.fingerprint.ISes
 static constexpr int32_t kVendorFingerDown = 22;
 static constexpr int32_t kVendorFingerUp = 23;
 
-static bool gMonitorRunning = false;
+static std::atomic_bool gMonitorRunning{false};
 static pthread_t gMonitorThread;
 static bool gPressed = false;
 static int gFodFd = -1;
@@ -61,25 +63,37 @@ struct ParcelCapture {
 static thread_local ParcelCapture gCapture = {nullptr, {0}, 0};
 
 static void writeFodNode(const char* val) {
+    const size_t len = strlen(val);
+
     pthread_mutex_lock(&gMutex);
-    int fd = gFodFd;
-    pthread_mutex_unlock(&gMutex);
-    if (fd < 0) {
+    if (gFodFd < 0) {
+        pthread_mutex_unlock(&gMutex);
         ALOGE("notify_fppress fd not open");
         return;
     }
-    ssize_t ret = pwrite(fd, val, strlen(val), 0);
-    ALOGI("notify_fppress <= %s (ret=%zd)", val, ret);
+
+    const ssize_t ret = pwrite(gFodFd, val, len, 0);
+    const int savedErrno = errno;
+    pthread_mutex_unlock(&gMutex);
+
+    if (ret != static_cast<ssize_t>(len)) {
+        ALOGE("notify_fppress <= %s failed: ret=%zd errno=%d (%s)",
+              val, ret, savedErrno, strerror(savedErrno));
+        return;
+    }
+
+    ALOGI("notify_fppress <= %s", val);
 }
 
 static void setPressed(bool pressed) {
     pthread_mutex_lock(&gMutex);
-    bool changed = (gPressed != pressed);
+    const bool oldPressed = gPressed;
+    const bool changed = oldPressed != pressed;
     gPressed = pressed;
     pthread_mutex_unlock(&gMutex);
 
     if (changed) {
-        ALOGI("setPressed: %d -> %d", !pressed, pressed);
+        ALOGI("setPressed: %d -> %d", oldPressed, pressed);
         writeFodNode(pressed ? "1" : "0");
     }
 }
@@ -99,12 +113,12 @@ static void notifySessionEnd() {
 static bool readFpState(int fd, int& x, int& y, int& state) {
     char buffer[128];
     if (lseek(fd, 0, SEEK_SET) < 0) {
-        ALOGE("readFpState: lseek failed");
+        ALOGE("readFpState: lseek failed: %s", strerror(errno));
         return false;
     }
     ssize_t len = read(fd, buffer, sizeof(buffer) - 1);
     if (len <= 0) {
-        ALOGE("readFpState: read failed, len=%zd", len);
+        ALOGE("readFpState: read failed, len=%zd: %s", len, strerror(errno));
         return false;
     }
     buffer[len] = '\0';
@@ -129,16 +143,21 @@ static void* monitorThread(void* /*arg*/) {
 
     ALOGI("monitorThread: started fd=%d", fd);
 
-    int lastState = 0, x, y, state;
-    readFpState(fd, x, y, state);
-    lastState = state;
+    int lastState = 0;
+    int x = 0;
+    int y = 0;
+    int state = 0;
+    if (readFpState(fd, x, y, state)) {
+        lastState = state;
+    }
 
     struct pollfd pfd = { .fd = fd, .events = POLLPRI | POLLERR, .revents = 0 };
 
-    while (gMonitorRunning) {
+    while (gMonitorRunning.load(std::memory_order_relaxed)) {
         int ret = poll(&pfd, 1, 200);
         if (ret < 0) {
-            ALOGE("monitorThread: poll failed, ret=%d", ret);
+            if (errno == EINTR) continue;
+            ALOGE("monitorThread: poll failed: %s", strerror(errno));
             continue;
         }
         if (!readFpState(fd, x, y, state)) continue;
@@ -208,7 +227,7 @@ static bool tryStartMonitor(bool* definitiveDisabled) {
     }
     ALOGI("startup: fp_state readable, notify_fppress fd=%d", gFodFd);
 
-    gMonitorRunning = true;
+    gMonitorRunning.store(true, std::memory_order_relaxed);
 
     if (pthread_create(&gMonitorThread, nullptr, monitorThread, nullptr) == 0) {
         pthread_setname_np(gMonitorThread, "FodMonitor");
@@ -216,7 +235,13 @@ static bool tryStartMonitor(bool* definitiveDisabled) {
         return true;
     }
     ALOGE("startup: failed to create monitor thread");
-    gMonitorRunning = false;
+    gMonitorRunning.store(false, std::memory_order_relaxed);
+    pthread_mutex_lock(&gMutex);
+    if (gFodFd >= 0) {
+        close(gFodFd);
+        gFodFd = -1;
+    }
+    pthread_mutex_unlock(&gMutex);
     return false;
 }
 
@@ -251,6 +276,10 @@ static binder_status_t sessionOnTransactWrapper(AIBinder* binder, transaction_co
     } else if (code == ISession::TRANSACTION_onPointerUpWithContext) {
         ALOGI("ISession::onPointerUpWithContext -> HBM off");
         setPressed(false);
+    }
+    if (!gOrigSessionOnTransact) {
+        ALOGE("ISession onTransact wrapper has no original handler");
+        return STATUS_UNKNOWN_ERROR;
     }
     return gOrigSessionOnTransact(binder, code, in, out);
 }
@@ -394,8 +423,7 @@ static void init() {
 __attribute__((destructor))
 static void cleanup() {
     ALOGI("OplusFodShim: destructor");
-    if (gMonitorRunning) {
-        gMonitorRunning = false;
+    if (gMonitorRunning.exchange(false, std::memory_order_relaxed)) {
         pthread_join(gMonitorThread, nullptr);
     }
     setPressed(false);
