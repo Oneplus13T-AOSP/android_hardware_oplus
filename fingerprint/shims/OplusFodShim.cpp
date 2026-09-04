@@ -22,6 +22,7 @@
 #include <atomic>
 #include <errno.h>
 
+using aidl::android::hardware::biometrics::fingerprint::AcquiredInfo;
 using aidl::android::hardware::biometrics::fingerprint::ISession;
 using aidl::android::hardware::biometrics::fingerprint::ISessionCallback;
 using android::base::GetProperty;
@@ -36,16 +37,48 @@ static const char kSessionDesc[] = "android.hardware.biometrics.fingerprint.ISes
  * OPlus fingerprint HAL vendor-specific onAcquired codes.
  * The HAL sends these via ISessionCallback::onAcquired to signal finger
  * down/up, even under AOD where the kernel's fp_state doesn't fire.
+ *
+ * They are only meaningful as the vendorCode argument, i.e. when the
+ * AcquiredInfo argument is VENDOR.
  */
 static constexpr int32_t kVendorFingerDown = 22;
 static constexpr int32_t kVendorFingerUp = 23;
+static constexpr int32_t kAcquiredVendor = static_cast<int32_t>(AcquiredInfo::VENDOR);
+
+/*
+ * Optional safety net: force-release the press if it has been held for this
+ * long without anything clearing it. A normal auth holds it ~150ms and an
+ * enroll capture well under a second, so a multi-second value cannot cut a
+ * legitimate capture short. Set to 0 to disable (default: disabled, so the
+ * runtime behaviour is identical to before).
+ */
+static constexpr int64_t kPressWatchdogMs = 0;
+
+/* Poll cadence and failure backoff for the fp_state monitor. */
+static constexpr int kPollTimeoutMs = 200;
+static constexpr int kReadFailBackoffMs = 50;
+static constexpr int kReadFailReopenAfter = 20;
 
 static std::atomic_bool gMonitorRunning{false};
 static pthread_t gMonitorThread;
+
+/*
+ * gStateMutex protects gPressed / gWaitRelease / gPressedAtMs.
+ * gIoMutex serializes the actual sysfs writes and the notify_fppress fd.
+ *
+ * Splitting them keeps the (blocking, ~10ms) sysfs write off the state lock
+ * while still guaranteeing that concurrent writers converge on the latest
+ * state instead of racing each other into an inconsistent node value.
+ */
+static pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gIoMutex = PTHREAD_MUTEX_INITIALIZER;
+
 static bool gPressed = false;
+static bool gWaitRelease = false;  // suppress press until fp_state returns to 0
+static int64_t gPressedAtMs = 0;
+
 static int gFodFd = -1;
-static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
-static bool gSessionEndReset = false;  // tells monitor to reset lastState
+static int gLastWritten = -1;  // -1 = unknown, 0/1 = last value pushed to sysfs
 
 static AIBinder_Class_onTransact gOrigSessionOnTransact = nullptr;
 
@@ -62,52 +95,111 @@ struct ParcelCapture {
 };
 static thread_local ParcelCapture gCapture = {nullptr, {0}, 0};
 
-static void writeFodNode(const char* val) {
-    const size_t len = strlen(val);
+static void resetCapture() {
+    gCapture.parcel = nullptr;
+    gCapture.count = 0;
+}
 
-    pthread_mutex_lock(&gMutex);
+static int64_t nowMs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * Push the current press state to the kernel.
+ *
+ * Everything happens under gIoMutex, and the value to write is re-read from
+ * the shared state inside that critical section. Concurrent callers therefore
+ * serialize and the node always ends up holding the most recent state, even
+ * if two threads flip gPressed in quick succession. Redundant writes are
+ * skipped via gLastWritten.
+ */
+static void syncFodNode() {
+    pthread_mutex_lock(&gIoMutex);
+
+    pthread_mutex_lock(&gStateMutex);
+    const bool want = gPressed;
+    pthread_mutex_unlock(&gStateMutex);
+
+    const int wantVal = want ? 1 : 0;
+    if (gLastWritten == wantVal) {
+        pthread_mutex_unlock(&gIoMutex);
+        return;
+    }
     if (gFodFd < 0) {
-        pthread_mutex_unlock(&gMutex);
+        pthread_mutex_unlock(&gIoMutex);
         ALOGE("notify_fppress fd not open");
         return;
     }
 
-    const ssize_t ret = pwrite(gFodFd, val, len, 0);
-    const int savedErrno = errno;
-    pthread_mutex_unlock(&gMutex);
+    const char* val = want ? "1" : "0";
+    const size_t len = 1;
 
-    if (ret != static_cast<ssize_t>(len)) {
+    ssize_t ret;
+    int savedErrno = 0;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ret = pwrite(gFodFd, val, len, 0);
+        savedErrno = errno;
+        if (ret == (ssize_t)len) break;
+        if (ret < 0 && (savedErrno == EINTR || savedErrno == EAGAIN)) continue;
+        break;
+    }
+
+    if (ret != (ssize_t)len) {
+        /*
+         * Leave gLastWritten untouched so the next transition retries rather
+         * than assuming the kernel already has this value.
+         */
+        pthread_mutex_unlock(&gIoMutex);
         ALOGE("notify_fppress <= %s failed: ret=%zd errno=%d (%s)",
               val, ret, savedErrno, strerror(savedErrno));
         return;
     }
 
+    gLastWritten = wantVal;
+    pthread_mutex_unlock(&gIoMutex);
+
     ALOGI("notify_fppress <= %s", val);
 }
 
 static void setPressed(bool pressed) {
-    pthread_mutex_lock(&gMutex);
+    pthread_mutex_lock(&gStateMutex);
     const bool oldPressed = gPressed;
     const bool changed = oldPressed != pressed;
     gPressed = pressed;
-    pthread_mutex_unlock(&gMutex);
+    if (changed && pressed) {
+        gPressedAtMs = nowMs();
+    }
+    pthread_mutex_unlock(&gStateMutex);
 
     if (changed) {
         ALOGI("setPressed: %d -> %d", oldPressed, pressed);
-        writeFodNode(pressed ? "1" : "0");
     }
+
+    /*
+     * Always sync, even when this caller saw no change: another thread may
+     * have flipped the state between its own update and its write, and this
+     * call converges the node onto the current value.
+     */
+    syncFodNode();
 }
 
 /*
- * Turn off HBM and tell the monitor thread to reset lastState to 0,
- * so the next fp_state=1 is treated as a fresh finger-down.
+ * Turn off HBM and arm the monitor to ignore fp_state until the finger is
+ * actually released.
+ *
+ * The sensor is stopped before the finger lifts, so fp_state can still read 1
+ * at this point. Simply zeroing lastState would make that stale 1 look like a
+ * fresh finger-down and re-enable HBM with no session running. Instead we wait
+ * for an observed transition to 0 before arming the next press.
  */
 static void notifySessionEnd() {
     ALOGI("notifySessionEnd: resetting session state");
     setPressed(false);
-    pthread_mutex_lock(&gMutex);
-    gSessionEndReset = true;
-    pthread_mutex_unlock(&gMutex);
+    pthread_mutex_lock(&gStateMutex);
+    gWaitRelease = true;
+    pthread_mutex_unlock(&gStateMutex);
 }
 
 static bool readFpState(int fd, int& x, int& y, int& state) {
@@ -133,11 +225,15 @@ static bool readFpState(int fd, int& x, int& y, int& state) {
  * Monitor thread: watches fp_state via poll() for instant wakeup.
  * Handles the lockscreen / light-AOD case where the touch driver DOES
  * report finger events.  Deep AOD is handled by the vendor code path.
+ *
+ * Note on sysfs semantics: sysfs_kf_poll() returns EPOLLERR|EPOLLPRI when the
+ * attribute changes, so POLLERR here is a normal notification, not a failure.
+ * Only POLLNVAL indicates a genuinely dead descriptor.
  */
 static void* monitorThread(void* /*arg*/) {
-    int fd = open(kFpStateNode, O_RDONLY);
+    int fd = open(kFpStateNode, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        ALOGE("monitorThread: failed to open %s", kFpStateNode);
+        ALOGE("monitorThread: failed to open %s: %s", kFpStateNode, strerror(errno));
         return nullptr;
     }
 
@@ -151,39 +247,99 @@ static void* monitorThread(void* /*arg*/) {
         lastState = state;
     }
 
-    struct pollfd pfd = { .fd = fd, .events = POLLPRI | POLLERR, .revents = 0 };
+    int readFailures = 0;
 
     while (gMonitorRunning.load(std::memory_order_relaxed)) {
-        int ret = poll(&pfd, 1, 200);
+        struct pollfd pfd = { .fd = fd, .events = POLLPRI | POLLERR, .revents = 0 };
+
+        int ret = poll(&pfd, 1, kPollTimeoutMs);
         if (ret < 0) {
             if (errno == EINTR) continue;
             ALOGE("monitorThread: poll failed: %s", strerror(errno));
+            usleep(kReadFailBackoffMs * 1000);
             continue;
         }
-        if (!readFpState(fd, x, y, state)) continue;
 
-        /*
-         * After a session ends (auth success/error/close), fp_state may
-         * stay at 1 because the sensor is stopped before the finger lifts.
-         * Reset lastState so the next real fp_state=1 is detected.
-         */
-        pthread_mutex_lock(&gMutex);
-        if (gSessionEndReset) {
-            gSessionEndReset = false;
-            ALOGI("monitor: session-end reset (lastState %d -> 0)", lastState);
-            lastState = 0;
+        if (pfd.revents & POLLNVAL) {
+            ALOGE("monitorThread: fd became invalid, reopening");
+            close(fd);
+            usleep(kReadFailBackoffMs * 1000);
+            fd = open(kFpStateNode, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                ALOGE("monitorThread: reopen failed: %s", strerror(errno));
+                usleep(500 * 1000);
+            }
+            continue;
         }
-        pthread_mutex_unlock(&gMutex);
 
-        if (ret > 0 && state != lastState) {
+        if (!readFpState(fd, x, y, state)) {
+            /*
+             * A failed read leaves the POLLPRI edge pending, so returning
+             * straight to poll() would spin. Back off, and reopen if this
+             * keeps happening.
+             */
+            if (++readFailures >= kReadFailReopenAfter) {
+                ALOGE("monitorThread: %d consecutive read failures, reopening",
+                      readFailures);
+                close(fd);
+                fd = open(kFpStateNode, O_RDONLY | O_CLOEXEC);
+                readFailures = 0;
+                if (fd < 0) {
+                    ALOGE("monitorThread: reopen failed: %s", strerror(errno));
+                    usleep(500 * 1000);
+                    continue;
+                }
+            }
+            usleep(kReadFailBackoffMs * 1000);
+            continue;
+        }
+        readFailures = 0;
+
+        bool waitRelease;
+        pthread_mutex_lock(&gStateMutex);
+        waitRelease = gWaitRelease;
+        pthread_mutex_unlock(&gStateMutex);
+
+        if (waitRelease) {
+            if (state == 0) {
+                pthread_mutex_lock(&gStateMutex);
+                gWaitRelease = false;
+                pthread_mutex_unlock(&gStateMutex);
+                ALOGI("monitor: session-end reset (lastState %d -> 0)", lastState);
+                lastState = 0;
+            } else {
+                /* Finger still down from the finished session: keep ignoring. */
+                lastState = state;
+            }
+            continue;
+        }
+
+        if (state != lastState) {
             ALOGI("fp_state: %d,%d,%d (was %d)", x, y, state, lastState);
             setPressed(state > 0);
             lastState = state;
+            continue;
+        }
+
+        if (kPressWatchdogMs > 0) {
+            bool stuck = false;
+            pthread_mutex_lock(&gStateMutex);
+            if (gPressed && gPressedAtMs != 0 &&
+                nowMs() - gPressedAtMs > kPressWatchdogMs) {
+                stuck = true;
+            }
+            pthread_mutex_unlock(&gStateMutex);
+            if (stuck) {
+                ALOGE("monitor: press held > %lldms, forcing release",
+                      (long long)kPressWatchdogMs);
+                setPressed(false);
+                lastState = state;
+            }
         }
     }
 
     ALOGI("monitorThread: stopped");
-    close(fd);
+    if (fd >= 0) close(fd);
     return nullptr;
 }
 
@@ -214,18 +370,21 @@ static bool tryStartMonitor(bool* definitiveDisabled) {
         return false;
     }
 
-    pthread_mutex_lock(&gMutex);
+    pthread_mutex_lock(&gIoMutex);
     if (gFodFd >= 0) {
         close(gFodFd);
         gFodFd = -1;
     }
     gFodFd = open(kFodNode, O_WRONLY | O_CLOEXEC);
-    pthread_mutex_unlock(&gMutex);
-    if (gFodFd < 0) {
-        ALOGE("startup: open %s failed, retrying", kFodNode);
+    gLastWritten = -1;  // unknown kernel state after (re)open
+    const int fodFd = gFodFd;
+    pthread_mutex_unlock(&gIoMutex);
+
+    if (fodFd < 0) {
+        ALOGE("startup: open %s failed: %s, retrying", kFodNode, strerror(errno));
         return false;
     }
-    ALOGI("startup: fp_state readable, notify_fppress fd=%d", gFodFd);
+    ALOGI("startup: fp_state readable, notify_fppress fd=%d", fodFd);
 
     gMonitorRunning.store(true, std::memory_order_relaxed);
 
@@ -236,12 +395,13 @@ static bool tryStartMonitor(bool* definitiveDisabled) {
     }
     ALOGE("startup: failed to create monitor thread");
     gMonitorRunning.store(false, std::memory_order_relaxed);
-    pthread_mutex_lock(&gMutex);
+    pthread_mutex_lock(&gIoMutex);
     if (gFodFd >= 0) {
         close(gFodFd);
         gFodFd = -1;
     }
-    pthread_mutex_unlock(&gMutex);
+    gLastWritten = -1;
+    pthread_mutex_unlock(&gIoMutex);
     return false;
 }
 
@@ -270,11 +430,13 @@ static void* startupThread(void* /*arg*/) {
 /* ISession incoming-call wrapper (if AIBinder_Class_define hook fires) */
 static binder_status_t sessionOnTransactWrapper(AIBinder* binder, transaction_code_t code,
                                                 const AParcel* in, AParcel* out) {
-    if (code == ISession::TRANSACTION_onPointerDownWithContext) {
-        ALOGI("ISession::onPointerDownWithContext -> HBM on");
+    if (code == ISession::TRANSACTION_onPointerDownWithContext ||
+        code == ISession::TRANSACTION_onPointerDown) {
+        ALOGI("ISession::onPointerDown -> HBM on");
         setPressed(true);
-    } else if (code == ISession::TRANSACTION_onPointerUpWithContext) {
-        ALOGI("ISession::onPointerUpWithContext -> HBM off");
+    } else if (code == ISession::TRANSACTION_onPointerUpWithContext ||
+               code == ISession::TRANSACTION_onPointerUp) {
+        ALOGI("ISession::onPointerUp -> HBM off");
         setPressed(false);
     }
     if (!gOrigSessionOnTransact) {
@@ -299,8 +461,17 @@ binder_status_t AIBinder_prepareTransaction(AIBinder* binder, AParcel** in) {
     }
 
     binder_status_t st = orig(binder, in);
-    gCapture.parcel = (in ? *in : nullptr);
-    gCapture.count = 0;
+
+    /*
+     * Only track the parcel when preparation actually succeeded; on failure
+     * *in is not a valid parcel we may compare against later.
+     */
+    if (st == STATUS_OK && in && *in) {
+        gCapture.parcel = *in;
+        gCapture.count = 0;
+    } else {
+        resetCapture();
+    }
     return st;
 }
 
@@ -337,22 +508,55 @@ binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code,
     static auto orig = (Fn)dlsym(RTLD_NEXT, "AIBinder_transact");
     if (!orig) {
         ALOGE("AIBinder_transact: dlsym failed");
+        resetCapture();
         return STATUS_UNKNOWN_ERROR;
     }
 
     /* onAcquired: inspect parcel for vendor finger down/up codes */
     if (code == ISessionCallback::TRANSACTION_onAcquired &&
         gCapture.parcel && in && *in == gCapture.parcel && gCapture.count > 0) {
-        for (int i = 0; i < gCapture.count; ++i) {
-            if (gCapture.vals[i] == kVendorFingerDown) {
-                ALOGI("onAcquired: vendor finger-down (%d) -> HBM on", kVendorFingerDown);
+        /*
+         * onAcquired(AcquiredInfo info, int32_t vendorCode): the vendor code
+         * only carries meaning when info == VENDOR, and it is the second
+         * int32 in the parcel. Match that shape first.
+         */
+        bool handled = false;
+        if (gCapture.count >= 2 && gCapture.vals[0] == kAcquiredVendor) {
+            const int32_t vendorCode = gCapture.vals[1];
+            if (vendorCode == kVendorFingerDown) {
+                ALOGI("onAcquired: vendor finger-down (%d) -> HBM on", vendorCode);
                 setPressed(true);
-                break;
-            }
-            if (gCapture.vals[i] == kVendorFingerUp) {
-                ALOGI("onAcquired: vendor finger-up (%d) -> HBM off", kVendorFingerUp);
+                handled = true;
+            } else if (vendorCode == kVendorFingerUp) {
+                ALOGI("onAcquired: vendor finger-up (%d) -> HBM off", vendorCode);
                 setPressed(false);
-                break;
+                handled = true;
+            } else {
+                handled = true;  // a vendor code we don't care about
+            }
+        }
+
+        /*
+         * Fallback to the original loose scan if the parcel didn't have the
+         * expected layout, so a future AIDL revision can't silently disable
+         * the AOD path. The warning makes the mismatch visible in logcat.
+         */
+        if (!handled) {
+            for (int i = 0; i < gCapture.count; ++i) {
+                if (gCapture.vals[i] == kVendorFingerDown) {
+                    ALOGW("onAcquired: finger-down matched by fallback scan "
+                          "(count=%d, vals[0]=%d) -> HBM on",
+                          gCapture.count, gCapture.vals[0]);
+                    setPressed(true);
+                    break;
+                }
+                if (gCapture.vals[i] == kVendorFingerUp) {
+                    ALOGW("onAcquired: finger-up matched by fallback scan "
+                          "(count=%d, vals[0]=%d) -> HBM off",
+                          gCapture.count, gCapture.vals[0]);
+                    setPressed(false);
+                    break;
+                }
             }
         }
     }
@@ -367,8 +571,7 @@ binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code,
 
     binder_status_t ret = orig(binder, code, in, out, flags);
 
-    gCapture.parcel = nullptr;
-    gCapture.count = 0;
+    resetCapture();
     return ret;
 }
 
@@ -397,9 +600,21 @@ AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
         strncmp(interfaceDescriptor, kSessionDesc, sizeof(kSessionDesc) - 1) == 0 &&
         (interfaceDescriptor[sizeof(kSessionDesc) - 1] == '\0' ||
          interfaceDescriptor[sizeof(kSessionDesc) - 1] == '/')) {
-        ALOGI("Wrapping ISession onTransact (descriptor: %s)", interfaceDescriptor);
-        gOrigSessionOnTransact = onTransact;
-        return orig(interfaceDescriptor, onCreate, onDestroy, sessionOnTransactWrapper);
+        /*
+         * Never wrap our own wrapper, and never overwrite an already-captured
+         * original: a second registration would otherwise make
+         * gOrigSessionOnTransact point at sessionOnTransactWrapper and recurse.
+         */
+        if (onTransact == sessionOnTransactWrapper) {
+            ALOGW("AIBinder_Class_define: already wrapped, passing through");
+        } else if (gOrigSessionOnTransact != nullptr) {
+            ALOGW("AIBinder_Class_define: ISession registered twice, "
+                  "keeping the first handler");
+        } else {
+            ALOGI("Wrapping ISession onTransact (descriptor: %s)", interfaceDescriptor);
+            gOrigSessionOnTransact = onTransact;
+            return orig(interfaceDescriptor, onCreate, onDestroy, sessionOnTransactWrapper);
+        }
     }
 
     return orig(interfaceDescriptor, onCreate, onDestroy, onTransact);
@@ -427,10 +642,11 @@ static void cleanup() {
         pthread_join(gMonitorThread, nullptr);
     }
     setPressed(false);
-    pthread_mutex_lock(&gMutex);
+    pthread_mutex_lock(&gIoMutex);
     if (gFodFd >= 0) {
         close(gFodFd);
         gFodFd = -1;
     }
-    pthread_mutex_unlock(&gMutex);
+    gLastWritten = -1;
+    pthread_mutex_unlock(&gIoMutex);
 }
