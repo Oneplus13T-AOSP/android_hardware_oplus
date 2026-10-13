@@ -97,8 +97,9 @@ public class OplusActivityTaskManager extends OplusBaseActivityTaskManager imple
         return true;
     }
 
-    public List<OplusAppInfo> getVisibleTasks(int displayId) {
-        return null;
+    public List<ActivityManager.RunningTaskInfo> getVisibleTasks(int displayId)
+            throws RemoteException {
+        return OplusWindowSceneCompat.getVisibleTasks(displayId);
     }
 
     public boolean unregisterTaskInfoChangeListener(OplusTaskInfoChangeListener listener) {

@@ -129,4 +129,18 @@ public class OplusActivityManager extends OplusBaseActivityManager implements IO
     public boolean registerTaskInfoChangeListener(com.oplus.app.OplusTaskInfoChangeListener listener, int arg1, int arg2) {
         return true;
     }
+
+    // Bridge the camera float-window scene to AOSP task notifications.
+    public boolean registerComplexSceneObserver(Bundle bundle,
+            com.oplus.osense.complexscene.OplusComplexSceneObserver observer)
+            throws RemoteException {
+        return OplusWindowSceneCompat.register(bundle, observer);
+    }
+
+    public boolean unregisterComplexSceneObserver(Bundle bundle,
+            com.oplus.osense.complexscene.OplusComplexSceneObserver observer)
+            throws RemoteException {
+        return OplusWindowSceneCompat.unregister(bundle, observer);
+    }
+
 }
